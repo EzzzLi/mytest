@@ -314,7 +314,7 @@ def ViT_B_16_21k(pretrained=False, pretrained_path=None, **kwargs):
     model_kwargs = dict(
         patch_size=16, embed_dim=768, depth=12, num_heads=12, representation_size=None, qkv_bias=False
     )
-    model = timm.models.vision_transformer._create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, num_classes=kwargs.num_classes, **kwargs)
+    model = timm.models.vision_transformer._create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, num_classes=kwargs.num_classes, **model_kwargs)
     if pretrained and pretrained_path!='':
         model = load_model_weights(model, pretrained_path)
     return model
