@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
+import timm
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.layers.helpers import to_2tuple
 
@@ -288,4 +289,32 @@ def vit_base_patch16_224(pretrained=False, pretrained_path=None, **kwargs):
     model = VisionTransformer(**model_kwargs)
     if pretrained:
         model = load_checkpoint(model, pretrained_path)   
+    return model
+
+## imagenet 21k pertrain model
+
+def load_model_weights(model, model_path):
+    state = torch.load(model_path, map_location='cpu')
+    for key in model.state_dict():
+        if 'num_batches_tracked' in key:
+            continue
+        p = model.state_dict()[key]
+        if key in state['state_dict']:
+            ip = state['state_dict'][key]
+            if p.shape == ip.shape:
+                p.data.copy_(ip.data)  # Copy the data of parameters
+            else:
+                print('could not load layer: {}, mismatch shape {} ,{}'.format(key, (p.shape), (ip.shape)))
+        else:
+            print('could not load layer: {}, not in checkpoint'.format(key))
+    return model
+
+
+def ViT_B_16_21k(pretrained=False, pretrained_path=None, **kwargs):
+    model_kwargs = dict(
+        patch_size=16, embed_dim=768, depth=12, num_heads=12, representation_size=None, qkv_bias=False
+    )
+    model = timm.models.vision_transformer._create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, num_classes=kwargs.num_classes, **kwargs)
+    if pretrained and pretrained_path!='':
+        model = load_model_weights(model, pretrained_path)
     return model
