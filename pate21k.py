@@ -12,36 +12,10 @@ from torch.utils.data import Subset
 import copy
 import timm
 from sam import SAM
-
+from transformers import ViTImageProcessor, ViTModel, SwinForImageClassification, AutoModelForImageClassification
 
 cifar100_std = (0.2675, 0.2565, 0.2761)
 cifar100_mean = (0.5071, 0.4867, 0.4408)
-
-def load_model_weights(model, model_path):
-    state = torch.load(model_path, map_location='cpu')
-    for key in model.state_dict():
-        if 'num_batches_tracked' in key:
-            continue
-        p = model.state_dict()[key]
-        if key in state['state_dict']:
-            ip = state['state_dict'][key]
-            if p.shape == ip.shape:
-                p.data.copy_(ip.data)  # Copy the data of parameters
-            else:
-                print(
-                    'could not load layer: {}, mismatch shape {} ,{}'.format(key, (p.shape), (ip.shape)))
-        else:
-            print('could not load layer: {}, not in checkpoint'.format(key))
-    return model
-
-def creat_model(args, pretrained = False):
-    model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, qkv_bias=False)
-    model = timm.models.vision_transformer._create_vision_transformer('vit_base_patch16_224_in21k',
-                                                                          pretrained=False,
-                                                                          num_classes=args.num_classes, **model_kwargs)
-    if pretrained:
-        load_model_weights(model, args.pretrain_file)
-    return model
 
 
 ## this is reprogramming code
@@ -62,7 +36,11 @@ class reProgrammingNetwork(nn.Module):
         elif args.model_name == 'vit':
             self.pre_model = torchvision.models.vit_b_32(pretrained=True)
         elif args.model_name == 'vit_21k':
-            self.pre_model = creat_model(args, pretrained=True)
+            self.pre_model = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+        elif args.model_name == 'swin_22k':
+            self.pre_model = SwinForImageClassification.from_pretrained("microsoft1/swin-base-patch4-window7-224-in22k/")
+        elif args.model_name == 'swinv2_22k':
+            self.pre_model = AutoModelForImageClassification.from_pretrained("microsoft/swinv2-base-patch4-window12-192-22k")
         self.pre_model.eval()
         for pram in self.pre_model.parameters():
             pram.requires_grad = False
@@ -75,7 +53,11 @@ class reProgrammingNetwork(nn.Module):
         self.M[:,self.H_start:self.H_end,self.W_start:self.W_end] = 0
         
         self.W = Parameter(torch.randn(channel_out, input_size, input_size, requires_grad=True, device=device))
-        self.new_layers = nn.Sequential(nn.ReLU(),nn.Linear(100, 1000), nn.Linear(1000,100))
+        # self.new_layers = nn.Sequential(nn.Linear(768, 100)) ## vit imaganet 21
+        self.new_layers = nn.Sequential(nn.Linear(21841, 1000), nn.Linear(1000, 100))
+        
+        # self.new_layers = nn.Sequential(nn.ReLU(),nn.Linear(768, 100))
+        # self.new_layers = nn.Sequential(nn.ReLU(),nn.Linear(100, 1000), nn.Linear(1000,100))
 
     def hg(self, imagenet_label):
         return imagenet_label[:,:10]
@@ -88,7 +70,9 @@ class reProgrammingNetwork(nn.Module):
         P = torch.tanh(self.W * self.M)
         X_adv = P + X
         Y_adv = self.pre_model(X_adv)
-        Y = self.new_layers(Y_adv)
+        # print(Y_adv[1])
+        # Y = self.new_layers(Y_adv[1]) ## vit image 21k
+        Y = self.new_layers(Y_adv[0]) ## swin image 22k
         return Y
     
 def set_seed(seed):
@@ -106,7 +90,7 @@ def train_model(dataset, test_dataset, args):
     batch_size = args.batch_size
     trainloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     testloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
-    model = reProgrammingNetwork(args, patch_H_size=args.size, patch_W_size=args.size,device=device).to(device)
+    model = reProgrammingNetwork(args,input_size=args.target_size, patch_H_size=args.size, patch_W_size=args.size,device=device).to(device)
     loss_function = nn.CrossEntropyLoss()
     # optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr = args.lr)
     ## SAM optimizer
@@ -122,12 +106,19 @@ def train_model(dataset, test_dataset, args):
         for i, (image, label) in enumerate(tqdm(trainloader)):
             optimizer.zero_grad()
             image, label = image.to(device), label.to(device)
+            # print(image.size())
+            # processor = ViTImageProcessor.from_pretrained('google/vit-base-patch16-224-in21k')
+            # image = processor(images=image, return_tensors="pt")
             label_hat = model(image)
             loss = loss_function(label_hat, label)
             train_loss += loss.item()
             train_acc += sum(label.cpu().numpy() == label_hat.data.cpu().numpy().argmax(1))
             loss.backward()
-            optimizer.step()
+            # optimizer.step()
+            optimizer.first_step(zero_grad=True)
+            
+            loss_function(model(image), label).backward()  # make sure to do a full forward pass
+            optimizer.second_step(zero_grad=True)
             
         scheduler.step()
         end_train_acc = train_acc/len(dataset)
@@ -136,18 +127,18 @@ def train_model(dataset, test_dataset, args):
               "Train Accuracy: {:.3f}".format(train_acc/len(dataset)),
               "lr: {}".format(scheduler.get_last_lr()[0]))
         # test
-        if epoch == num_epochs-1:
-            model.eval()
-            with torch.no_grad():
-                for image, label in testloader:
-                    image = image.to(device)
-                    preds = model(image).data.cpu().numpy().argmax(1)
-                    test_acc += sum(label.cpu().numpy() == preds)
-            testacc = test_acc/float(len(test_dataset))
-            print("Test Accuracy: {:.3f}".format(testacc))
-            if testacc > best_test_acc:
-                  best_test_acc = testacc
-            print("Best Test acc:", best_test_acc)
+        # if epoch == num_epochs-1:
+        #     model.eval()
+        #     with torch.no_grad():
+        #         for image, label in testloader:
+        #             image = image.to(device)
+        #             preds = model(image).data.cpu().numpy().argmax(1)
+        #             test_acc += sum(label.cpu().numpy() == preds)
+        #     testacc = test_acc/float(len(test_dataset))
+        #     print("Test Accuracy: {:.3f}".format(testacc))
+        #     if testacc > best_test_acc:
+        #           best_test_acc = testacc
+        #     print("Best Test acc:", best_test_acc)
         
     # torch.save(model.state_dict(), checkpoint_file)
     return end_train_acc, best_test_acc, model
@@ -174,16 +165,18 @@ def main():
     parser = argparse.ArgumentParser(description='pate train')
     parser.add_argument('--seed', type=int, default=8872574) #4
     parser.add_argument('--device', type=str, default='cpu')
-    parser.add_argument('--teacher_num', type=int, default=150)
+    parser.add_argument('--teacher_num', type=int, default=200,
+                       choices=[150, 200, 250, 300, 500])
     parser.add_argument('--dataset', type=str, default='CIFAR10')
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epoch', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=0.01)
-    parser.add_argument('--LR_step', type=int, default=3)
-    parser.add_argument('--gamma', type=float, default=0.9)
+    parser.add_argument('--epoch', type=int, default=25)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--LR_step', type=int, default=5)
+    parser.add_argument('--gamma', type=float, default=1)
     parser.add_argument('--size', type=int, default=192)
-    parser.add_argument('--model_name', type=str, default='vit_21k',
-                       choices=['wideresnet', 'resnet50', 'resnet152', 'swin', 'vit', 'vit_21k'])
+    parser.add_argument('--target_size', type=int, default=224)
+    parser.add_argument('--model_name', type=str, default='swinv2_22k',
+                       choices=['wideresnet', 'resnet50', 'resnet152', 'swin', 'vit', 'vit_21k', 'swin_22k', 'swinv2_22k'])
     parser.add_argument('--pretrain_file', type=str, default='./vit_base_patch16_224_miil_21k.pth')
     parser.add_argument('--num_classes', type=int, default=100)
 
@@ -206,6 +199,7 @@ def main():
         transforms.ToTensor(),
         transforms.Normalize(cifar100_mean, cifar100_std),
         ])
+    # train_dataset = datasets.CIFAR100('./data/', train=True, transform=train_transform, download=True, )
     train_dataset = datasets.CIFAR100('./data/', train=True, transform=train_transform, download=True, )
     private_dataset = datasets.CIFAR100('./data/', train=False, transform=test_transform, download=True, )
     private_data_size = len(private_dataset)

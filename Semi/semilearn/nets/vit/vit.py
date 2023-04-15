@@ -9,12 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-import timm
-from timm.models.layers import DropPath, trunc_normal_
-from timm.models.layers.helpers import to_2tuple
 
 from semilearn.nets.utils import load_checkpoint
-
+from transformers import  ViTModel, SwinForImageClassification, AutoModelForImageClassification
+from PIL import Image
+import requests
+from torchvision import transforms
 
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding
@@ -309,12 +309,43 @@ def load_model_weights(model, model_path):
             print('could not load layer: {}, not in checkpoint'.format(key))
     return model
 
+class ViT_base_16_21k(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pre_model = ViTModel.from_pretrained('google/vit-base-patch16-224-in21k')
+        self.nnlayer = nn.Linear(768,100)
+        self.trans = transforms.Resize(224)
+        
+    def forward(self, image):
+        image = self.trans(image)
+        x = self.pre_model(image)
+        output = self.nnlayer(x[1])
+        feat = x[0]
+        return {'logits':output, 'feat':feat}
 
-def ViT_B_16_21k(pretrained=False, pretrained_path=None, **kwargs):
-    model_kwargs = dict(
-        patch_size=16, embed_dim=768, depth=12, num_heads=12, representation_size=None, qkv_bias=False
-    )
-    model = timm.models.vision_transformer._create_vision_transformer('vit_base_patch16_224_in21k', pretrained=False, num_classes=kwargs.num_classes, **model_kwargs)
-    if pretrained and pretrained_path!='':
-        model = load_model_weights(model, pretrained_path)
+def vit_base_patch16_224_21k(pretrained=False, pretrained_path=None, **kwargs):
+    model = ViT_base_16_21k()
+    return model
+
+class Swin_base_patch4_window7_224_in22k(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pre_model = SwinForImageClassification.from_pretrained("microsoft/swin-base-patch4-window7-224-in22k")
+        self.nnlayer = nn.Sequential(nn.Linear(21841, 1000), nn.Linear(1000, 100))
+        self.trans = transforms.Resize(224)
+#         self.pre_model = AutoModelForImageClassification.from_pretrained("microsoft/swinv2-base-patch4-window12-192-22k")
+#         self.nnlayer = nn.Sequential(nn.Linear(21841, 1000), nn.Linear(1000, 100))
+#         self.trans = transforms.Resize(192)
+        
+    def forward(self, image):
+        image = self.trans(image)
+        x = self.pre_model(image,output_hidden_states=True)
+        # print(x)
+        output = self.nnlayer(x['logits'])
+        feat = x['reshaped_hidden_states']
+        # print(feat[-1])
+        return {'logits':output, 'feat':feat[-1]}
+
+def swin_base_patch4_window7_224_in22k(pretrained=False, pretrained_path=None, **kwargs):
+    model = Swin_base_patch4_window7_224_in22k()
     return model

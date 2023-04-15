@@ -1,20 +1,177 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-
+from PIL import Image
 import os
 import contextlib
 import numpy as np
 from inspect import signature
 from collections import OrderedDict
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-
+import numpy as np
+from torchvision import transforms
+from torchvision import datasets
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
-
+from torch.utils.data import Dataset
+from itertools import accumulate
 from semilearn.core.hooks import Hook, get_priority, CheckpointHook, TimerHook, LoggingHook, DistSamplerSeedHook, ParamUpdateHook, EvaluationHook, EMAHook, WANDBHook, AimHook
 from semilearn.core.utils import get_dataset, get_data_loader, get_optimizer, get_cosine_schedule_with_warmup, Bn_Controller
 from semilearn.core.criterions import CELoss, ConsistencyLoss
+from semilearn.datasets.augmentation import RandAugment, RandomResizedCropAndInterpolation
+cifar100_mean = (0.5071, 0.4867, 0.4408)
+cifar100_std = (0.2675, 0.2565, 0.2761)
+
+def random_split(lengths, seed):
+    torch.manual_seed(seed)
+    indices = torch.randperm(sum(lengths)).tolist()
+    return [indices[offset - length:offset] for offset, length in zip(accumulate(lengths), lengths)]
+
+def split_ssl_data(file_name):
+    base_dataset = datasets.CIFAR100("./data/cifar100", train=False, download=True)
+    #8872574
+    index = random_split([2000, 1000, len(base_dataset)-3000], 8872574) 
+    noisy_label = torch.load(f"../{file_name}.pth").numpy().tolist()
+    i = 0
+    index[2].extend(index[0])
+    while i < len(noisy_label):
+        if noisy_label[i] == -1:
+            del noisy_label[i]
+            del index[0][i]
+            i -= 1
+        i+=1
+    label = CIFAR100SSL("./data/cifar100", index[0], noisy_targets=noisy_label , train=False, download=True)
+    u_label = CIFAR100SSL("./data/cifar100", index[2] , train=False, download=True)
+    test = CIFAR100SSL("./data/cifar100", index[1] , train=False, download=True)
+    return label.data, label.targets, u_label.data, u_label.targets, test.data, test.targets, 
+
+class CIFAR100SSL(datasets.CIFAR100):
+    def __init__(self, root, indexs, noisy_targets=None,train=True,
+                 transform=None, target_transform=None,
+                 download=False):
+        super().__init__(root, train=train,
+                         transform=transform,
+                         target_transform=target_transform,
+                         download=download)
+        if indexs is not None:
+            self.data = self.data[indexs]
+            if noisy_targets is None:
+                self.targets = np.array(self.targets)[indexs]
+            else:
+                self.targets = np.array(noisy_targets)
+        # self.targets = np.array(self.targets)
+
+    def __getitem__(self, index):
+        img, target = self.data[index], self.targets[index]
+        print(img)
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+
+class BasicDataset(Dataset):
+    """
+    BasicDataset returns a pair of image and labels (targets).
+    If targets are not given, BasicDataset returns None as the label.
+    This class supports strong augmentation for Fixmatch,
+    and return both weakly and strongly augmented images.
+    """
+
+    def __init__(self,
+                 alg,
+                 data,
+                 targets=None,
+                 num_classes=None,
+                 transform=None,
+                 is_ulb=False,
+                 strong_transform=None,
+                 onehot=False,
+                 *args, 
+                 **kwargs):
+        """
+        Args
+            data: x_data
+            targets: y_data (if not exist, None)
+            num_classes: number of label classes
+            transform: basic transformation of data
+            use_strong_transform: If True, this dataset returns both weakly and strongly augmented images.
+            strong_transform: list of transformation functions for strong augmentation
+            onehot: If True, label is converted into onehot vector.
+        """
+        super(BasicDataset, self).__init__()
+        self.alg = alg
+        self.data = data
+        self.targets = targets
+
+        self.num_classes = num_classes
+        self.is_ulb = is_ulb
+        self.onehot = onehot
+
+        self.transform = transform
+        self.strong_transform = strong_transform
+        if self.strong_transform is None:
+            if self.is_ulb:
+                assert self.alg not in ['fullysupervised', 'supervised', 'pseudolabel', 'vat', 'pimodel', 'meanteacher', 'mixmatch'], f"alg {self.alg} requires strong augmentation"
+    
+    def __sample__(self, idx):
+        """ dataset specific sample function """
+        # set idx-th target
+        if self.targets is None:
+            target = None
+        else:
+            target_ = self.targets[idx]
+            target = target_ if not self.onehot else get_onehot(self.num_classes, target_)
+
+        # set augmented images
+        img = self.data[idx]
+        return img, target
+
+    def __getitem__(self, idx):
+        """
+        If strong augmentation is not used,
+            return weak_augment_image, target
+        else:
+            return weak_augment_image, strong_augment_image, target
+        """
+        img, target = self.__sample__(idx)
+
+        if self.transform is None:
+            return  {'x_lb':  transforms.ToTensor()(img), 'y_lb': target}
+        else:
+            if isinstance(img, np.ndarray):
+                img = Image.fromarray(img)
+            img_w = self.transform(img)
+            if not self.is_ulb:
+                return {'idx_lb': idx, 'x_lb': img_w, 'y_lb': target} 
+            else:
+                if self.alg == 'fullysupervised' or self.alg == 'supervised':
+                    return {'idx_ulb': idx}
+                elif self.alg == 'pseudolabel' or self.alg == 'vat':
+                    return {'idx_ulb': idx, 'x_ulb_w':img_w} 
+                elif self.alg == 'pimodel' or self.alg == 'meanteacher' or self.alg == 'mixmatch':
+                    # NOTE x_ulb_s here is weak augmentation
+                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s': self.transform(img)}
+                elif self.alg == 'remixmatch':
+                    rotate_v_list = [0, 90, 180, 270]
+                    rotate_v1 = np.random.choice(rotate_v_list, 1).item()
+                    img_s1 = self.strong_transform(img)
+                    img_s1_rot = torchvision.transforms.functional.rotate(img_s1, rotate_v1)
+                    img_s2 = self.strong_transform(img)
+                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s_0': img_s1, 'x_ulb_s_1':img_s2, 'x_ulb_s_0_rot':img_s1_rot, 'rot_v':rotate_v_list.index(rotate_v1)}
+                elif self.alg == 'comatch':
+                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s_0': self.strong_transform(img), 'x_ulb_s_1':self.strong_transform(img)} 
+                else:
+                    return {'idx_ulb': idx, 'x_ulb_w': img_w, 'x_ulb_s': self.strong_transform(img)} 
+
+
+    def __len__(self):
+        return len(self.data)
 
 
 class AlgorithmBase:
@@ -113,17 +270,52 @@ class AlgorithmBase:
         """
         set dataset_dict
         """
-        if self.rank != 0 and self.distributed:
-            torch.distributed.barrier()
-        dataset_dict = get_dataset(self.args, self.algorithm, self.args.dataset, self.args.num_labels, self.args.num_classes, self.args.data_dir, self.args.include_lb_to_ulb)
-        if dataset_dict is None:
-            return dataset_dict
+#         if self.rank != 0 and self.distributed:
+#             torch.distributed.barrier()
+#         dataset_dict = get_dataset(self.args, self.algorithm, self.args.dataset, self.args.num_labels, self.args.num_classes, self.args.data_dir, self.args.include_lb_to_ulb)
+#         if dataset_dict is None:
+#             return dataset_dict
 
+#         self.args.ulb_dest_len = len(dataset_dict['train_ulb']) if dataset_dict['train_ulb'] is not None else 0
+#         self.args.lb_dest_len = len(dataset_dict['train_lb'])
+#         self.print_fn("unlabeled data number: {}, labeled data number {}".format(self.args.ulb_dest_len, self.args.lb_dest_len))
+#         if self.rank == 0 and self.distributed:
+#             torch.distributed.barrier()
+            
+        lb_data, lb_target, ulb_data, ulb_target, test_data, test_target = split_ssl_data(self.args.noisy_file)
+        crop_size = 32
+        crop_ratio = 0.875
+        transform_weak = transforms.Compose([
+            transforms.Resize(crop_size),
+            transforms.RandomCrop(crop_size, padding=int(crop_size * (1 - crop_ratio)), padding_mode='reflect'),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(cifar100_mean, cifar100_std)
+        ])
+
+        transform_strong = transforms.Compose([
+            transforms.Resize(crop_size),
+            transforms.RandomCrop(crop_size, padding=int(crop_size * (1 - crop_ratio)), padding_mode='reflect'),
+            transforms.RandomHorizontalFlip(),
+            RandAugment(3, 5),
+            transforms.ToTensor(),
+            transforms.Normalize(cifar100_mean, cifar100_std)
+        ])
+
+        transform_val = transforms.Compose([
+            transforms.Resize(crop_size),
+            transforms.ToTensor(),
+            transforms.Normalize(cifar100_mean, cifar100_std)
+        ])
+
+        lb_dataset = BasicDataset(self.args.algorithm, lb_data, lb_target, num_classes=self.args.num_classes, transform=transform_weak, is_ulb=False)
+        ulb_dataset = BasicDataset(self.args.algorithm, ulb_data, ulb_target,num_classes=self.args.num_classes, transform=transform_weak, is_ulb=True, strong_transform=transform_strong)
+        eval_dataset = BasicDataset(self.args.algorithm, test_data, test_target,num_classes=self.args.num_classes, transform=transform_val, is_ulb=False)
+        dataset_dict = {'train_lb': lb_dataset, 'train_ulb': ulb_dataset, 'eval':eval_dataset, 'test':None}
+        
         self.args.ulb_dest_len = len(dataset_dict['train_ulb']) if dataset_dict['train_ulb'] is not None else 0
         self.args.lb_dest_len = len(dataset_dict['train_lb'])
         self.print_fn("unlabeled data number: {}, labeled data number {}".format(self.args.ulb_dest_len, self.args.lb_dest_len))
-        if self.rank == 0 and self.distributed:
-            torch.distributed.barrier()
         return dataset_dict
 
     def set_data_loader(self):

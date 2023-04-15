@@ -40,7 +40,7 @@ def get_net_builder(net_name, from_name: bool):
 
 
 
-def get_logger(name, save_path=None, level='INFO'):
+def get_logger(args, name, save_path=None, level='INFO'):
     """
     create logger function
     """
@@ -50,7 +50,7 @@ def get_logger(name, save_path=None, level='INFO'):
     if not save_path is None:
         os.makedirs(save_path, exist_ok=True)
         log_format = logging.Formatter('[%(asctime)s %(levelname)s] %(message)s')
-        fileHandler = logging.FileHandler(os.path.join(save_path, 'log.txt'))
+        fileHandler = logging.FileHandler(f"./log/{args.noisy_file}_{args.seed}.txt")
         fileHandler.setFormatter(log_format)
         logger.addHandler(fileHandler)
 
@@ -63,7 +63,7 @@ def get_dataset(args, algorithm, dataset, num_labels, num_classes, data_dir='./d
 
     Args
         args: argparse arguments
-        algorithm: algorithm name, used for specific return items in __getitem__ of datasets
+        algorithm: algrorithm name, used for specific return items in __getitem__ of datasets
         dataset: dataset name 
         num_labels: number of labeled data in dataset
         num_classes: number of classes

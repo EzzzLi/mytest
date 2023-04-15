@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 from semilearn.algorithms import get_algorithm, name2alg
 from semilearn.imb_algorithms import get_imb_algorithm, name2imbalg
 from semilearn.core.utils import get_net_builder, get_logger, get_port, send_model_cuda, count_parameters, over_write_args_from_file, TBLog
-
+# from semilearn import get_dataset, get_data_loader, Trainer
 
 def get_config():
     from semilearn.algorithms.utils import str2bool
@@ -138,6 +138,8 @@ def get_config():
                              'N processes per node, which has N GPUs. This is the '
                              'fastest way to use PyTorch for either single node or '
                              'multi node data parallel training')
+    
+    parser.add_argument('--noisy_file', default='', type=str)
     # config file
     parser.add_argument('--c', type=str, default='')
 
@@ -178,7 +180,7 @@ def main(args):
         if args.load_path is None:
             raise Exception('Resume of training requires --load_path in the args')
         if os.path.abspath(save_path) == os.path.abspath(args.load_path) and not args.overwrite:
-            raise Exception('Saving & Loading paths are same. \
+            raise Exception('Saving & Loading pathes are same. \
                             If you want over-write, give --overwrite in the argument.')
 
     if args.seed is not None:
@@ -219,7 +221,7 @@ def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
 
-    # random seed has to be set for the synchronization of labeled data sampling in each process.
+    # random seed has to be set for the syncronization of labeled data sampling in each process.
     assert args.seed is not None
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -247,7 +249,7 @@ def main_worker(gpu, ngpus_per_node, args):
         tb_log = TBLog(save_path, 'tensorboard', use_tensorboard=args.use_tensorboard)
         logger_level = "INFO"
 
-    logger = get_logger(args.save_name, save_path, logger_level)
+    logger = get_logger(args, args.save_name, save_path, logger_level)
     logger.info(f"Use GPU: {args.gpu} for training")
 
     _net_builder = get_net_builder(args.net, args.net_from_name)
@@ -257,7 +259,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model = get_algorithm(args, _net_builder, tb_log, logger)
     logger.info(f'Number of Trainable Params: {count_parameters(model.model)}')
-
+    torch.manual_seed(args.seed)
     # SET Devices for (Distributed) DataParallel
     model.model = send_model_cuda(args, model.model)
     model.ema_model = send_model_cuda(args, model.ema_model, clip_batch=False)
@@ -276,7 +278,6 @@ def main_worker(gpu, ngpus_per_node, args):
     if hasattr(model, 'warmup'):
         logger.info(("Warmup stage"))
         model.warmup()
-
     # START TRAINING of FixMatch
     logger.info("Model training")
     model.train()
@@ -290,6 +291,15 @@ def main_worker(gpu, ngpus_per_node, args):
         model.finetune()
 
     logging.warning(f"GPU {args.rank} training is FINISHED")
+    
+#     dataset_dict = get_dataset(args, args.algorithm, args.dataset, args.num_labels, args.num_classes, data_dir=args.data_dir, include_lb_to_ulb=args.include_lb_to_ulb)
+#     # print(len(dataset_dict['train_lb']))
+#     train_lb_loader = get_data_loader(args, dataset_dict['train_lb'], args.batch_size)
+#     train_ulb_loader = get_data_loader(args, dataset_dict['train_ulb'], int(args.batch_size * args.uratio))
+#     eval_loader = get_data_loader(args, dataset_dict['eval'], args.eval_batch_size)
+
+#     trainer = Trainer(args, model)
+#     trainer.fit(train_lb_loader, train_ulb_loader, eval_loader)
 
 
 if __name__ == "__main__":
